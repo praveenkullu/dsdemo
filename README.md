@@ -1,12 +1,13 @@
 # Primary-Backup Key-Value Store
 
-A fault-tolerant distributed key-value store implementation using the Primary-Backup replication scheme in Go. This project demonstrates fundamental distributed systems concepts including:
+A fault-tolerant distributed key-value store implementation using the Primary-Backup replication scheme in Go with gRPC. This project demonstrates fundamental distributed systems concepts including:
 
 - Primary-Backup replication
 - Failure detection via heartbeating
 - Automatic failover
 - Synchronous replication
 - State transfer
+- gRPC-based communication
 
 ## System Architecture
 
@@ -38,27 +39,49 @@ A library that provides a simple interface to the KV service:
 ```
 .
 ├── viewservice/          # View Service implementation
-│   ├── common.go        # Common types and RPC definitions
-│   └── server.go        # View Service logic
+│   └── server.go        # View Service gRPC server logic
 ├── kvserver/            # KV Server implementation
-│   ├── common.go        # Common types and RPC definitions
-│   └── server.go        # KV Server logic with Primary/Backup roles
+│   └── server.go        # KV Server gRPC logic with Primary/Backup roles
 ├── client/              # Client library
-│   └── client.go        # Client with automatic failover
+│   └── client.go        # gRPC client with automatic failover
 ├── cmd/                 # Executable programs
 │   ├── viewservice/     # View Service binary
 │   ├── kvserver/        # KV Server binary
 │   └── testclient/      # Test client binary
-├── proto/               # Protocol definitions (for reference)
+├── proto/               # Protocol Buffer definitions and generated code
+│   ├── viewservice.proto    # View Service protobuf definitions
+│   ├── kvserver.proto       # KV Server protobuf definitions
+│   ├── *.pb.go             # Generated protobuf code
+│   └── *_grpc.pb.go        # Generated gRPC code
 ├── Makefile            # Build automation
 ├── test.sh             # Comprehensive test script
+├── generate_proto.sh   # Script to regenerate protobuf code
 └── go.mod              # Go module definition
 ```
 
 ## Prerequisites
 
 - Go 1.21 or later
+- Protocol Buffers compiler (protoc) - for regenerating proto files (optional)
 - Make (optional, for using Makefile commands)
+
+### Installing protoc (optional - only needed to regenerate proto files)
+
+**Ubuntu/Debian:**
+```bash
+sudo apt-get install protobuf-compiler
+```
+
+**macOS:**
+```bash
+brew install protobuf
+```
+
+**Install Go plugins:**
+```bash
+go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+```
 
 ## Building
 
@@ -227,12 +250,13 @@ When a new Backup joins:
 
 ## Implementation Notes
 
-- **RPC Framework**: Uses Go's built-in `net/rpc` package
+- **RPC Framework**: Uses gRPC with Protocol Buffers for efficient, type-safe communication
 - **Synchronous Replication**: Primary waits for Backup ACK before responding to client
 - **Consistency**: Ensures Backup is never behind Primary
 - **Fault Tolerance**: Handles single server failures (Primary or Backup)
 - **No Network Partitions**: Assumes reliable network (as per requirements)
 - **Single Point of Failure**: View Service is a SPOF (acceptable for this lab)
+- **gRPC Features**: Context-based timeouts, connection pooling, and structured error handling
 
 ## Known Limitations
 

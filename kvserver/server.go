@@ -1,13 +1,15 @@
 package kvserver
 
 import (
+	"context"
 	"log"
 	"net"
-	"net/rpc"
 	"sync"
 	"time"
 
-	"github.com/praveenkullu/dsdemo/viewservice"
+	pb "github.com/praveenkullu/dsdemo/proto"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 const (
@@ -16,54 +18,53 @@ const (
 
 // KVServer is a key-value server that can act as Primary or Backup
 type KVServer struct {
-	mu   sync.Mutex
-	l    net.Listener
-	dead bool
-	me   string // my server name/address
+	pb.UnimplementedKVServerServer
+	mu         sync.Mutex
+	listener   net.Listener
+	grpcServer *grpc.Server
+	dead       bool
+	me         string // my server name/address
 
-	vsAddress string // view service address
-	vsClient  *rpc.Client
+	vsAddress string            // view service address
+	vsClient  pb.ViewServiceClient
+	vsConn    *grpc.ClientConn
 
-	currentView  viewservice.View
+	currentView  *pb.View
 	data         map[string]string
 	role         string // "primary", "backup", or "idle"
 	lastBackup   string // last known backup address
 	syncing      bool   // true when state transfer is in progress
-	pendingQueue []PutArgs // queue for puts during state transfer
+	pendingQueue []*pb.PutRequest // queue for puts during state transfer
 }
 
 // StartServer creates and starts a new KV server
 func StartServer(serverName string, vsAddress string) *KVServer {
 	kv := &KVServer{
-		me:           serverName,
-		vsAddress:    vsAddress,
-		data:         make(map[string]string),
-		role:         "idle",
-		lastBackup:   "",
-		syncing:      false,
-		pendingQueue: make([]PutArgs, 0),
+		me:        serverName,
+		vsAddress: vsAddress,
+		data:      make(map[string]string),
+		role:      "idle",
+		lastBackup: "",
+		syncing:    false,
+		pendingQueue: make([]*pb.PutRequest, 0),
+		currentView: &pb.View{},
 	}
-
-	// Register RPC service
-	rpcs := rpc.NewServer()
-	rpcs.Register(kv)
 
 	// Start listening
-	l, err := net.Listen("tcp", serverName)
+	lis, err := net.Listen("tcp", serverName)
 	if err != nil {
-		log.Fatal("KVServer listen error:", err)
+		log.Fatalf("KVServer failed to listen: %v", err)
 	}
-	kv.l = l
+	kv.listener = lis
 
-	// Start RPC server
+	// Create gRPC server
+	kv.grpcServer = grpc.NewServer()
+	pb.RegisterKVServerServer(kv.grpcServer, kv)
+
+	// Start gRPC server in background
 	go func() {
-		for !kv.dead {
-			conn, err := kv.l.Accept()
-			if err == nil && !kv.dead {
-				go rpcs.ServeConn(conn)
-			} else if err != nil && !kv.dead {
-				log.Printf("KVServer accept error: %v\n", err)
-			}
+		if err := kv.grpcServer.Serve(lis); err != nil && !kv.dead {
+			log.Fatalf("KVServer failed to serve: %v", err)
 		}
 	}()
 
@@ -80,10 +81,11 @@ func StartServer(serverName string, vsAddress string) *KVServer {
 // connectToViewService establishes connection to view service
 func (kv *KVServer) connectToViewService() {
 	for !kv.dead {
-		client, err := rpc.Dial("tcp", kv.vsAddress)
+		conn, err := grpc.Dial(kv.vsAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err == nil {
 			kv.mu.Lock()
-			kv.vsClient = client
+			kv.vsConn = conn
+			kv.vsClient = pb.NewViewServiceClient(conn)
 			kv.mu.Unlock()
 			log.Printf("Connected to view service at %s\n", kv.vsAddress)
 			return
@@ -111,15 +113,17 @@ func (kv *KVServer) ping() {
 		return
 	}
 
-	args := &viewservice.PingArgs{
+	req := &pb.PingRequest{
 		ServerName: kv.me,
 		ViewNumber: kv.currentView.ViewNumber,
 	}
-	reply := &viewservice.PingReply{}
 	client := kv.vsClient
 	kv.mu.Unlock()
 
-	err := client.Call("ViewServer.Ping", args, reply)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	resp, err := client.Ping(ctx, req)
 	if err != nil {
 		log.Printf("Ping error: %v\n", err)
 		return
@@ -129,7 +133,7 @@ func (kv *KVServer) ping() {
 	defer kv.mu.Unlock()
 
 	oldView := kv.currentView
-	kv.currentView = reply.View
+	kv.currentView = resp.View
 
 	// Check if view has changed
 	if oldView.ViewNumber != kv.currentView.ViewNumber {
@@ -138,7 +142,7 @@ func (kv *KVServer) ping() {
 }
 
 // handleViewChange handles changes in the view
-func (kv *KVServer) handleViewChange(oldView viewservice.View) {
+func (kv *KVServer) handleViewChange(oldView *pb.View) {
 	log.Printf("View changed from %d to %d (Primary: %s, Backup: %s)\n",
 		oldView.ViewNumber, kv.currentView.ViewNumber,
 		kv.currentView.Primary, kv.currentView.Backup)
@@ -184,7 +188,7 @@ func (kv *KVServer) transferState(backup string, viewNumber uint64) {
 	log.Printf("Transferring state to backup %s (view %d)\n", backup, viewNumber)
 
 	// Connect to backup
-	client, err := rpc.Dial("tcp", backup)
+	conn, err := grpc.Dial(backup, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Printf("Failed to connect to backup %s: %v\n", backup, err)
 		kv.mu.Lock()
@@ -192,16 +196,20 @@ func (kv *KVServer) transferState(backup string, viewNumber uint64) {
 		kv.mu.Unlock()
 		return
 	}
-	defer client.Close()
+	defer conn.Close()
+
+	client := pb.NewKVServerClient(conn)
 
 	// Send state
-	args := &SyncStateArgs{
+	req := &pb.SyncStateRequest{
 		Data:       dataCopy,
 		ViewNumber: viewNumber,
 	}
-	reply := &SyncStateReply{}
 
-	err = client.Call("KVServer.SyncState", args, reply)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_, err = client.SyncState(ctx, req)
 	if err != nil {
 		log.Printf("SyncState RPC failed: %v\n", err)
 		kv.mu.Lock()
@@ -219,12 +227,11 @@ func (kv *KVServer) transferState(backup string, viewNumber uint64) {
 	if len(kv.pendingQueue) > 0 {
 		log.Printf("Processing %d pending puts\n", len(kv.pendingQueue))
 		pending := kv.pendingQueue
-		kv.pendingQueue = make([]PutArgs, 0)
+		kv.pendingQueue = make([]*pb.PutRequest, 0)
 		kv.mu.Unlock()
 
-		for _, putArgs := range pending {
-			reply := &PutReply{}
-			kv.Put(&putArgs, reply)
+		for _, putReq := range pending {
+			kv.Put(context.Background(), putReq)
 		}
 	} else {
 		kv.mu.Unlock()
@@ -232,42 +239,54 @@ func (kv *KVServer) transferState(backup string, viewNumber uint64) {
 }
 
 // Get RPC handler
-func (kv *KVServer) Get(args *GetArgs, reply *GetReply) error {
+func (kv *KVServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
 	if kv.role != "primary" {
-		reply.Err = ErrNotPrimary
-		return nil
+		return &pb.GetResponse{
+			Value: "",
+			Ok:    false,
+			Error: "ErrNotPrimary",
+		}, nil
 	}
 
-	value, ok := kv.data[args.Key]
+	value, ok := kv.data[req.Key]
 	if ok {
-		reply.Value = value
-		reply.Err = OK
-	} else {
-		reply.Err = ErrNoKey
+		return &pb.GetResponse{
+			Value: value,
+			Ok:    true,
+			Error: "",
+		}, nil
 	}
 
-	return nil
+	return &pb.GetResponse{
+		Value: "",
+		Ok:    false,
+		Error: "ErrNoKey",
+	}, nil
 }
 
 // Put RPC handler
-func (kv *KVServer) Put(args *PutArgs, reply *PutReply) error {
+func (kv *KVServer) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
 	kv.mu.Lock()
 
 	if kv.role != "primary" {
 		kv.mu.Unlock()
-		reply.Err = ErrNotPrimary
-		return nil
+		return &pb.PutResponse{
+			Ok:    false,
+			Error: "ErrNotPrimary",
+		}, nil
 	}
 
 	// If state transfer is in progress, queue the request
 	if kv.syncing {
-		kv.pendingQueue = append(kv.pendingQueue, *args)
+		kv.pendingQueue = append(kv.pendingQueue, req)
 		kv.mu.Unlock()
-		reply.Err = OK
-		return nil
+		return &pb.PutResponse{
+			Ok:    true,
+			Error: "",
+		}, nil
 	}
 
 	backup := kv.currentView.Backup
@@ -275,20 +294,23 @@ func (kv *KVServer) Put(args *PutArgs, reply *PutReply) error {
 
 	// If there's a backup, forward the update
 	if backup != "" {
-		client, err := rpc.Dial("tcp", backup)
+		conn, err := grpc.Dial(backup, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			log.Printf("Failed to connect to backup %s: %v\n", backup, err)
 			// Continue anyway, update local state
 		} else {
-			defer client.Close()
+			defer conn.Close()
+			client := pb.NewKVServerClient(conn)
 
-			forwardArgs := &ForwardUpdateArgs{
-				Key:   args.Key,
-				Value: args.Value,
+			forwardReq := &pb.ForwardUpdateRequest{
+				Key:   req.Key,
+				Value: req.Value,
 			}
-			forwardReply := &ForwardUpdateReply{}
 
-			err = client.Call("KVServer.ForwardUpdate", forwardArgs, forwardReply)
+			forwardCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			_, err = client.ForwardUpdate(forwardCtx, forwardReq)
 			if err != nil {
 				log.Printf("ForwardUpdate RPC failed: %v\n", err)
 				// Continue anyway, update local state
@@ -298,52 +320,60 @@ func (kv *KVServer) Put(args *PutArgs, reply *PutReply) error {
 
 	// Update local state
 	kv.mu.Lock()
-	kv.data[args.Key] = args.Value
+	kv.data[req.Key] = req.Value
 	kv.mu.Unlock()
 
-	reply.Err = OK
-	return nil
+	return &pb.PutResponse{
+		Ok:    true,
+		Error: "",
+	}, nil
 }
 
 // ForwardUpdate RPC handler (called by Primary on Backup)
-func (kv *KVServer) ForwardUpdate(args *ForwardUpdateArgs, reply *ForwardUpdateReply) error {
+func (kv *KVServer) ForwardUpdate(ctx context.Context, req *pb.ForwardUpdateRequest) (*pb.ForwardUpdateResponse, error) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
 	if kv.role != "backup" {
-		reply.Err = ErrNotPrimary
-		return nil
+		return &pb.ForwardUpdateResponse{
+			Ok: false,
+		}, nil
 	}
 
-	kv.data[args.Key] = args.Value
-	reply.Err = OK
-	return nil
+	kv.data[req.Key] = req.Value
+	return &pb.ForwardUpdateResponse{
+		Ok: true,
+	}, nil
 }
 
 // SyncState RPC handler (called by Primary on new Backup for state transfer)
-func (kv *KVServer) SyncState(args *SyncStateArgs, reply *SyncStateReply) error {
+func (kv *KVServer) SyncState(ctx context.Context, req *pb.SyncStateRequest) (*pb.SyncStateResponse, error) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	log.Printf("Receiving state transfer: %d keys\n", len(args.Data))
+	log.Printf("Receiving state transfer: %d keys\n", len(req.Data))
 
 	// Overwrite local state
 	kv.data = make(map[string]string)
-	for k, v := range args.Data {
+	for k, v := range req.Data {
 		kv.data[k] = v
 	}
 
-	reply.Err = OK
-	return nil
+	return &pb.SyncStateResponse{
+		Ok: true,
+	}, nil
 }
 
 // Kill shuts down the server
 func (kv *KVServer) Kill() {
 	kv.dead = true
-	if kv.l != nil {
-		kv.l.Close()
+	if kv.grpcServer != nil {
+		kv.grpcServer.GracefulStop()
 	}
-	if kv.vsClient != nil {
-		kv.vsClient.Close()
+	if kv.listener != nil {
+		kv.listener.Close()
+	}
+	if kv.vsConn != nil {
+		kv.vsConn.Close()
 	}
 }

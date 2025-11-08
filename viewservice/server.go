@@ -1,17 +1,20 @@
 package viewservice
 
 import (
+	"context"
 	"log"
 	"net"
-	"net/rpc"
 	"sync"
 	"time"
+
+	pb "github.com/praveenkullu/dsdemo/proto"
+	"google.golang.org/grpc"
 )
 
 const (
-	PingInterval    = 500 * time.Millisecond // Servers ping every 0.5 seconds
-	DeadInterval    = 1500 * time.Millisecond // Servers are declared dead after 1.5 seconds
-	TickerInterval  = 500 * time.Millisecond // Ticker runs every 0.5 seconds
+	PingInterval   = 500 * time.Millisecond  // Servers ping every 0.5 seconds
+	DeadInterval   = 1500 * time.Millisecond // Servers are declared dead after 1.5 seconds
+	TickerInterval = 500 * time.Millisecond  // Ticker runs every 0.5 seconds
 )
 
 // ServerInfo tracks information about each server
@@ -23,22 +26,22 @@ type ServerInfo struct {
 
 // ViewServer is the View Service implementation
 type ViewServer struct {
-	mu       sync.Mutex
-	l        net.Listener
-	dead     bool
-	rpcCount int // for testing
+	pb.UnimplementedViewServiceServer
+	mu         sync.Mutex
+	listener   net.Listener
+	grpcServer *grpc.Server
+	dead       bool
 
-	currentView View
-	servers     map[string]*ServerInfo // tracks all servers that have pinged
-	idleServers []string               // servers that are not primary or backup
-
-	primaryAcked bool // primary has acknowledged the current view
+	currentView  *pb.View
+	servers      map[string]*ServerInfo // tracks all servers that have pinged
+	idleServers  []string               // servers that are not primary or backup
+	primaryAcked bool                   // primary has acknowledged the current view
 }
 
 // StartServer creates and starts a new ViewServer
 func StartServer(address string) *ViewServer {
 	vs := &ViewServer{
-		currentView: View{
+		currentView: &pb.View{
 			ViewNumber: 0,
 			Primary:    "",
 			Backup:     "",
@@ -48,26 +51,21 @@ func StartServer(address string) *ViewServer {
 		primaryAcked: true, // no primary initially, so considered acked
 	}
 
-	// Register RPC service
-	rpcs := rpc.NewServer()
-	rpcs.Register(vs)
-
 	// Start listening
-	l, err := net.Listen("tcp", address)
+	lis, err := net.Listen("tcp", address)
 	if err != nil {
-		log.Fatal("ViewServer listen error:", err)
+		log.Fatalf("ViewServer failed to listen: %v", err)
 	}
-	vs.l = l
+	vs.listener = lis
 
-	// Start RPC server
+	// Create gRPC server
+	vs.grpcServer = grpc.NewServer()
+	pb.RegisterViewServiceServer(vs.grpcServer, vs)
+
+	// Start gRPC server in background
 	go func() {
-		for !vs.dead {
-			conn, err := vs.l.Accept()
-			if err == nil && !vs.dead {
-				go rpcs.ServeConn(conn)
-			} else if err != nil && !vs.dead {
-				log.Printf("ViewServer accept error: %v\n", err)
-			}
+		if err := vs.grpcServer.Serve(lis); err != nil && !vs.dead {
+			log.Fatalf("ViewServer failed to serve: %v", err)
 		}
 	}()
 
@@ -79,47 +77,42 @@ func StartServer(address string) *ViewServer {
 }
 
 // Ping RPC handler - called by KV servers every 0.5 seconds
-func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
+func (vs *ViewServer) Ping(ctx context.Context, req *pb.PingRequest) (*pb.PingResponse, error) {
 	vs.mu.Lock()
 	defer vs.mu.Unlock()
 
-	vs.rpcCount++
-
 	// Update server's last ping time
-	if server, exists := vs.servers[args.ServerName]; exists {
+	if server, exists := vs.servers[req.ServerName]; exists {
 		server.LastPingTime = time.Now()
 		server.Alive = true
 	} else {
 		// New server
-		vs.servers[args.ServerName] = &ServerInfo{
-			Name:         args.ServerName,
+		vs.servers[req.ServerName] = &ServerInfo{
+			Name:         req.ServerName,
 			LastPingTime: time.Now(),
 			Alive:        true,
 		}
 		// Add to idle servers if not already primary or backup
-		if args.ServerName != vs.currentView.Primary && args.ServerName != vs.currentView.Backup {
-			vs.idleServers = append(vs.idleServers, args.ServerName)
+		if req.ServerName != vs.currentView.Primary && req.ServerName != vs.currentView.Backup {
+			vs.idleServers = append(vs.idleServers, req.ServerName)
 		}
 	}
 
 	// Check if primary has acked the current view
-	if args.ServerName == vs.currentView.Primary && args.ViewNumber == vs.currentView.ViewNumber {
+	if req.ServerName == vs.currentView.Primary && req.ViewNumber == vs.currentView.ViewNumber {
 		vs.primaryAcked = true
 	}
 
 	// Return current view
-	reply.View = vs.currentView
-	return nil
+	return &pb.PingResponse{View: vs.currentView}, nil
 }
 
 // GetView RPC handler - called by clients to find the current primary
-func (vs *ViewServer) GetView(args *GetViewArgs, reply *GetViewReply) error {
+func (vs *ViewServer) GetView(ctx context.Context, req *pb.GetViewRequest) (*pb.GetViewResponse, error) {
 	vs.mu.Lock()
 	defer vs.mu.Unlock()
 
-	vs.rpcCount++
-	reply.View = vs.currentView
-	return nil
+	return &pb.GetViewResponse{View: vs.currentView}, nil
 }
 
 // ticker runs periodically to detect failures and manage promotions
@@ -236,12 +229,10 @@ func (vs *ViewServer) removeFromIdle(serverName string) {
 // Kill shuts down the server
 func (vs *ViewServer) Kill() {
 	vs.dead = true
-	vs.l.Close()
-}
-
-// GetRPCCount returns the number of RPC calls (for testing)
-func (vs *ViewServer) GetRPCCount() int {
-	vs.mu.Lock()
-	defer vs.mu.Unlock()
-	return vs.rpcCount
+	if vs.grpcServer != nil {
+		vs.grpcServer.GracefulStop()
+	}
+	if vs.listener != nil {
+		vs.listener.Close()
+	}
 }

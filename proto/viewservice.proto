@@ -1,8 +1,8 @@
 syntax = "proto3";
 
-package viewservice;
+package proto;
 
-option go_package = "github.com/praveenkullu/dsdemo/proto/viewservice";
+option go_package = "github.com/praveenkullu/dsdemo/proto";
 
 // View represents the current system configuration
 message View {

@@ -1,20 +1,23 @@
 package client
 
 import (
+	"context"
 	"log"
-	"net/rpc"
 	"time"
 
-	"github.com/praveenkullu/dsdemo/kvserver"
-	"github.com/praveenkullu/dsdemo/viewservice"
+	pb "github.com/praveenkullu/dsdemo/proto"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 // Client is a client for the KV service
 type Client struct {
 	vsAddress      string
-	vsClient       *rpc.Client
+	vsClient       pb.ViewServiceClient
+	vsConn         *grpc.ClientConn
 	currentPrimary string
-	primaryClient  *rpc.Client
+	primaryClient  pb.KVServerClient
+	primaryConn    *grpc.ClientConn
 }
 
 // MakeClient creates a new client
@@ -26,9 +29,10 @@ func MakeClient(vsAddress string) *Client {
 
 	// Connect to view service
 	for {
-		client, err := rpc.Dial("tcp", vsAddress)
+		conn, err := grpc.Dial(vsAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err == nil {
-			ck.vsClient = client
+			ck.vsConn = conn
+			ck.vsClient = pb.NewViewServiceClient(conn)
 			log.Printf("Client connected to view service at %s\n", vsAddress)
 			break
 		}
@@ -41,7 +45,7 @@ func MakeClient(vsAddress string) *Client {
 
 // Get retrieves the value for a key
 func (ck *Client) Get(key string) string {
-	args := &kvserver.GetArgs{Key: key}
+	req := &pb.GetRequest{Key: key}
 
 	for {
 		// Get current primary
@@ -54,19 +58,21 @@ func (ck *Client) Get(key string) string {
 		}
 
 		// Try to call Get on primary
-		reply := &kvserver.GetReply{}
-		err := ck.call("KVServer.Get", args, reply)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		resp, err := ck.primaryClient.Get(ctx, req)
+		cancel()
 
-		if err == nil && reply.Err == kvserver.OK {
-			return reply.Value
-		} else if err == nil && reply.Err == kvserver.ErrNoKey {
+		if err == nil && resp.Ok {
+			return resp.Value
+		} else if err == nil && resp.Error == "ErrNoKey" {
 			return ""
-		} else if err != nil || reply.Err == kvserver.ErrNotPrimary {
+		} else if err != nil || resp.Error == "ErrNotPrimary" {
 			// Primary changed or failed, update and retry
 			log.Printf("Get failed, updating primary and retrying...\n")
 			ck.currentPrimary = ""
-			if ck.primaryClient != nil {
-				ck.primaryClient.Close()
+			if ck.primaryConn != nil {
+				ck.primaryConn.Close()
+				ck.primaryConn = nil
 				ck.primaryClient = nil
 			}
 			time.Sleep(500 * time.Millisecond)
@@ -76,7 +82,7 @@ func (ck *Client) Get(key string) string {
 
 // Put stores a key-value pair
 func (ck *Client) Put(key string, value string) {
-	args := &kvserver.PutArgs{Key: key, Value: value}
+	req := &pb.PutRequest{Key: key, Value: value}
 
 	for {
 		// Get current primary
@@ -89,17 +95,19 @@ func (ck *Client) Put(key string, value string) {
 		}
 
 		// Try to call Put on primary
-		reply := &kvserver.PutReply{}
-		err := ck.call("KVServer.Put", args, reply)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		resp, err := ck.primaryClient.Put(ctx, req)
+		cancel()
 
-		if err == nil && reply.Err == kvserver.OK {
+		if err == nil && resp.Ok {
 			return
-		} else if err != nil || reply.Err == kvserver.ErrNotPrimary {
+		} else if err != nil || resp.Error == "ErrNotPrimary" {
 			// Primary changed or failed, update and retry
 			log.Printf("Put failed, updating primary and retrying...\n")
 			ck.currentPrimary = ""
-			if ck.primaryClient != nil {
-				ck.primaryClient.Close()
+			if ck.primaryConn != nil {
+				ck.primaryConn.Close()
+				ck.primaryConn = nil
 				ck.primaryClient = nil
 			}
 			time.Sleep(500 * time.Millisecond)
@@ -109,47 +117,42 @@ func (ck *Client) Put(key string, value string) {
 
 // updatePrimary queries the view service for the current primary
 func (ck *Client) updatePrimary() {
-	args := &viewservice.GetViewArgs{}
-	reply := &viewservice.GetViewReply{}
+	req := &pb.GetViewRequest{}
 
-	err := ck.vsClient.Call("ViewServer.GetView", args, reply)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	resp, err := ck.vsClient.GetView(ctx, req)
+	cancel()
+
 	if err != nil {
 		log.Printf("GetView failed: %v\n", err)
 		return
 	}
 
-	if reply.View.Primary != "" && reply.View.Primary != ck.currentPrimary {
-		ck.currentPrimary = reply.View.Primary
-		if ck.primaryClient != nil {
-			ck.primaryClient.Close()
+	if resp.View.Primary != "" && resp.View.Primary != ck.currentPrimary {
+		ck.currentPrimary = resp.View.Primary
+		if ck.primaryConn != nil {
+			ck.primaryConn.Close()
 		}
 
 		// Connect to new primary
-		client, err := rpc.Dial("tcp", ck.currentPrimary)
+		conn, err := grpc.Dial(ck.currentPrimary, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			log.Printf("Failed to connect to primary %s: %v\n", ck.currentPrimary, err)
 			ck.currentPrimary = ""
 			return
 		}
-		ck.primaryClient = client
+		ck.primaryConn = conn
+		ck.primaryClient = pb.NewKVServerClient(conn)
 		log.Printf("Client connected to primary %s\n", ck.currentPrimary)
 	}
 }
 
-// call makes an RPC call to the primary
-func (ck *Client) call(method string, args interface{}, reply interface{}) error {
-	if ck.primaryClient == nil {
-		return rpc.ErrShutdown
-	}
-	return ck.primaryClient.Call(method, args, reply)
-}
-
 // Close closes the client connections
 func (ck *Client) Close() {
-	if ck.vsClient != nil {
-		ck.vsClient.Close()
+	if ck.vsConn != nil {
+		ck.vsConn.Close()
 	}
-	if ck.primaryClient != nil {
-		ck.primaryClient.Close()
+	if ck.primaryConn != nil {
+		ck.primaryConn.Close()
 	}
 }

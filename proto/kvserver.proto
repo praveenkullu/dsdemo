@@ -1,8 +1,8 @@
 syntax = "proto3";
 
-package kvserver;
+package proto;
 
-option go_package = "github.com/praveenkullu/dsdemo/proto/kvserver";
+option go_package = "github.com/praveenkullu/dsdemo/proto";
 
 // GetRequest is sent by clients to retrieve a value
 message GetRequest {

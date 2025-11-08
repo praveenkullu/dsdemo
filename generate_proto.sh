@@ -1,19 +1,15 @@
 #!/bin/bash
 
-# Generate Go code from proto files
+# Generate Go code from proto files using gRPC
 
-# Create output directories
-mkdir -p proto/viewservice
-mkdir -p proto/kvserver
+# Add Go bin to PATH (for protoc-gen-go and protoc-gen-go-grpc)
+export PATH=$PATH:$(go env GOPATH)/bin
 
-# Generate viewservice proto
+# Generate proto files
 protoc --go_out=. --go_opt=paths=source_relative \
     --go-grpc_out=. --go-grpc_opt=paths=source_relative \
-    proto/viewservice.proto
-
-# Generate kvserver proto
-protoc --go_out=. --go_opt=paths=source_relative \
-    --go-grpc_out=. --go-grpc_opt=paths=source_relative \
-    proto/kvserver.proto
+    proto/viewservice.proto proto/kvserver.proto
 
 echo "Proto files generated successfully!"
+echo "Generated files:"
+ls -lh proto/*.pb.go
