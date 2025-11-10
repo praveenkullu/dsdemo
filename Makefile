@@ -1,4 +1,4 @@
-.PHONY: build clean test run-vs run-s1 run-s2 run-s3 run-client help
+.PHONY: build clean test test-auto run-vs run-s1 run-s2 run-s3 run-client help
 
 # Default target
 all: build
@@ -11,6 +11,7 @@ build:
 	@go build -o bin/viewservice ./cmd/viewservice
 	@go build -o bin/kvserver ./cmd/kvserver
 	@go build -o bin/testclient ./cmd/testclient
+	@go build -o bin/testcli ./cmd/testcli
 	@echo "✓ Build completed"
 
 # Clean build artifacts and logs
@@ -57,6 +58,12 @@ test: build
 	@chmod +x test.sh
 	@./test.sh
 
+# Run automated test suite
+test-auto: build
+	@mkdir -p logs
+	@chmod +x automated_test.sh
+	@./automated_test.sh
+
 # Download dependencies
 deps:
 	@echo "Downloading Go dependencies..."
@@ -75,7 +82,8 @@ help:
 	@echo "  make run-s2      - Run KV Server S2"
 	@echo "  make run-s3      - Run KV Server S3"
 	@echo "  make run-client  - Run test client"
-	@echo "  make test        - Run comprehensive test suite"
+	@echo "  make test        - Run manual test suite"
+	@echo "  make test-auto   - Run automated test suite (recommended)"
 	@echo "  make deps        - Download and update dependencies"
 	@echo "  make help        - Show this help message"
 	@echo ""

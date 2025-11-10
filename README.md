@@ -155,21 +155,44 @@ make run-client
 
 ## Testing
 
-### Run the comprehensive test suite
+### Automated Test Suite (Recommended)
+
+The automated test suite fully validates the Primary-Backup implementation according to the lab requirements:
+
+```bash
+make test-auto
+```
+
+Or run directly:
+```bash
+./automated_test.sh
+```
+
+**What it tests:**
+1. ✓ View Service startup
+2. ✓ KV Server S1 startup and Primary assignment
+3. ✓ View verification (S1 as Primary)
+4. ✓ Client Put/Get operations
+5. ✓ KV Server S2 startup and Backup assignment
+6. ✓ View verification (S1 Primary, S2 Backup)
+7. ✓ Replication (Put with Backup)
+8. ✓ Primary failure handling (Kill S1)
+9. ✓ Failover to Backup (S2 becomes Primary)
+10. ✓ Data persistence after failover
+11. ✓ State transfer (S3 joins as Backup)
+12. ✓ New Backup receives full state from Primary
+13. ✓ Second failover (Kill S2, S3 becomes Primary)
+14. ✓ Complete data integrity verification
+
+**Output:** Color-coded test results with pass/fail counters and detailed logs in `logs/automated_test/`
+
+### Manual Test Suite
 
 ```bash
 make test
 ```
 
-This test script follows the test plan from the lab requirements:
-1. Starts View Service
-2. Starts KV Server S1 (becomes Primary)
-3. Performs Put/Get operations
-4. Starts KV Server S2 (becomes Backup)
-5. Tests Primary failure (kills S1, S2 should be promoted)
-6. Tests state transfer (starts S3, should receive full state from S2)
-7. Tests new Backup promotion (kills S2, S3 should be promoted)
-8. Verifies data integrity throughout all failures
+This is an interactive test script that requires manual verification at each step.
 
 ### Manual Testing Scenarios
 
